@@ -138,7 +138,7 @@ export interface HandState {
      * 公開乱数（drand）。ディールを押した瞬間にシードと order を確定し、round を決める（frozenAt）。
      * value が届いたら山札を作って配る。届くまではベットの変更も着席も受け付けない
      */
-    beacon?: { round: number; frozenAt: number; value?: BeaconValue };
+    beacon?: { round: number; frozenAt: number; value?: BeaconValue; dealRequested?: boolean };
   };
 }
 
@@ -323,6 +323,7 @@ export function createRoom(
 export function apply(state: RoomState, ctx: Ctx, cmd: Command): RoomState {
   const s = structuredClone(state);
   handle(s, ctx, cmd);
+  autoFreeze(s, ctx);
   s.seq++;
   return s;
 }
@@ -347,7 +348,10 @@ function handle(s: RoomState, ctx: Ctx, cmd: Command): void {
       if (s.phase !== 'BETTING' || !b || b.value || cmd.handNo !== s.handNo) throw new RoomError('STALE', '公開乱数を待っていません');
       if (cmd.value.round !== b.round || !isBeaconConsistent(cmd.value)) throw new RoomError('BAD_REQUEST', '公開乱数の値が正しくありません');
       b.value = { network: 'quicknet', round: cmd.value.round, randomness: cmd.value.randomness, signature: cmd.value.signature };
-      return deal(s, now);
+      // ディーラーがもう押していれば配る。まだならディールを待つ（取得の締切は解除）
+      if (b.dealRequested) return deal(s, now);
+      s.hand!.deadline = null;
+      return;
     }
     case 'DEALER_PRESENCE':
       if (cmd.connected) s.dealerGoneAt = null;
@@ -607,7 +611,7 @@ function join(s: RoomState, userId: string, cmd: Extract<Command, { t: 'JOIN' }>
     account: cmd.account,
   });
   s.seats.sort((a, b) => a.seat - b.seat);
-  if (s.phase === 'BETTING' && s.hand && !awaitingBeacon(s)) s.hand.players.push(newHandPlayer(userId));
+  if (s.phase === 'BETTING' && s.hand && !seedsFrozen(s)) s.hand.players.push(newHandPlayer(userId));
   log(s, now, `${clean} が着席しました`);
 }
 
@@ -641,30 +645,26 @@ function advance(s: RoomState, ctx: Ctx): void {
     }
     case 'BETTING': {
       const hand = s.hand!;
-      const confirmed = hand.players.filter((p) => p.status === 'CONFIRMED');
-      if (confirmed.length === 0) {
+      // 全員のベット確定で自動的にシードを確定・公開乱数を待ち始めている場合: 届いていれば配る、まだなら届き次第配る
+      const b = hand.fair?.beacon;
+      if (b) {
+        if (b.value) return deal(s, now);
+        b.dealRequested = true;
+        return;
+      }
+      if (!hand.players.some((p) => p.status === 'CONFIRMED')) {
         s.hand = null;
         s.phase = 'WAITING';
         log(s, now, `ハンド #${s.handNo} は参加者がいないため無効になりました`);
         return;
       }
-      // 山札はサーバーシード（コミット済み）・参加者のクライアントシード・公開乱数から決まる（検算方法は engine/fair.ts）
-      // まず参加者とシードをここで確定する（以後は変えられない）
-      const fair = (hand.fair ??= newFair(ctx));
-      const order = confirmed.map((p) => p.userId);
-      fair.clientSeeds = Object.fromEntries(Object.entries(fair.clientSeeds).filter(([id]) => order.includes(id)));
-      fair.order = order;
-      for (const p of hand.players) if (p.status === 'BETTING') p.status = 'SITTING_OUT';
-      hand.players = confirmed;
+      freezeSeeds(s, ctx);
       if (!s.config.useBeacon) {
         log(s, now, '⚠ 公開乱数なしでディール（卓の設定で OFF）');
         return deal(s, now);
       }
-      // 確定した時点ではまだ誰も知らない drand の未来のラウンドを待ってから配る（運営もシードを選び直せない）
-      const round = beaconTargetRound(now);
-      fair.beacon = { round, frozenAt: now };
-      hand.deadline = now + BEACON_TIMEOUT_MS;
-      log(s, now, `参加者のシードを確定（${confirmed.length} 人）。公開乱数 drand #${round} を待っています`);
+      // ディーラーが先に押したので、公開乱数が届き次第すぐ配る
+      s.hand!.fair!.beacon!.dealRequested = true;
       return;
     }
     case 'PREFLOP': {
@@ -704,6 +704,45 @@ function advance(s: RoomState, ctx: Ctx): void {
       log(s, now, `ディーラー 2 枚目: ${s.hand!.dealerHole[1]}`);
       return showdown(s, now);
   }
+}
+
+/**
+ * 参加者とクライアントシードを確定する（以後は変えられない）。公開乱数を使う卓は、確定した時点ではまだ誰も知らない
+ * drand の未来のラウンドを決めて待ち始める（運営もシードを選び直せない）。
+ * 山札はサーバーシード（コミット済み）・参加者のクライアントシード・公開乱数から決まる（検算方法は engine/fair.ts）
+ */
+function freezeSeeds(s: RoomState, ctx: Ctx): void {
+  const { now } = ctx;
+  const hand = s.hand!;
+  const confirmed = hand.players.filter((p) => p.status === 'CONFIRMED');
+  const fair = (hand.fair ??= newFair(ctx));
+  const order = confirmed.map((p) => p.userId);
+  fair.clientSeeds = Object.fromEntries(Object.entries(fair.clientSeeds).filter(([id]) => order.includes(id)));
+  fair.order = order;
+  for (const p of hand.players) if (p.status === 'BETTING') p.status = 'SITTING_OUT';
+  hand.players = confirmed;
+  if (!s.config.useBeacon) return;
+  const round = beaconTargetRound(now);
+  fair.beacon = { round, frozenAt: now };
+  hand.deadline = now + BEACON_TIMEOUT_MS;
+  log(s, now, `参加者のシードを確定（${confirmed.length} 人）。公開乱数 drand #${round} を待っています`);
+}
+
+/**
+ * 全員がベットを確定（または見送り）したら、ディーラーのディールを待たずにシードを確定して公開乱数を待ち始める。
+ * ディーラーが押すころには値が届いているので、すぐ配れる（確定後はベットの取り消しはできない）
+ */
+function autoFreeze(s: RoomState, ctx: Ctx): void {
+  const hand = s.hand;
+  if (s.closed || s.phase !== 'BETTING' || !hand || !s.config.useBeacon || hand.fair?.beacon) return;
+  if (hand.players.length === 0 || hand.players.some((p) => p.status === 'BETTING')) return;
+  if (!hand.players.some((p) => p.status === 'CONFIRMED')) return;
+  freezeSeeds(s, ctx);
+}
+
+/** シードを確定済み（公開乱数を待っている・または届いてディールを待っている）か */
+function seedsFrozen(s: Pick<RoomState, 'phase' | 'hand'>): boolean {
+  return s.phase === 'BETTING' && !!s.hand?.fair?.beacon;
 }
 
 /** 確定済みのシード（と公開乱数）から山札を作って配る */
@@ -1035,8 +1074,12 @@ export function lockState(s: RoomState, now: number): Omit<DealerControls, 'next
         : { canAdvance: false, lockReason: '着席しているプレイヤーがいません', waitingFor: [] };
     }
     case 'BETTING': {
-      if (awaitingBeacon(s)) {
-        return { canAdvance: false, lockReason: `公開乱数 drand #${s.hand!.fair!.beacon!.round} を待っています`, waitingFor: [] };
+      const b = s.hand!.fair?.beacon;
+      if (b) {
+        // シード確定済み: 公開乱数が届いていれば（またはまだ押していなければ）ディールを押せる
+        return b.dealRequested && !b.value
+          ? { canAdvance: false, lockReason: `公開乱数 drand #${b.round} を待っています`, waitingFor: [] }
+          : { canAdvance: true, lockReason: null, waitingFor: [] };
       }
       const waiting = s.hand!.players.filter((p) => p.status === 'BETTING').map((p) => p.userId);
       return waiting.length
@@ -1261,7 +1304,7 @@ function committed(hp: HandPlayer | undefined): number {
 
 function inDealtHand(s: RoomState, userId: string): boolean {
   // 公開乱数を待っている間も、参加者は確定済み（配る順が決まっている）なので途中で抜けられない
-  const dealing = (s.phase !== 'WAITING' && s.phase !== 'BETTING') || awaitingBeacon(s);
+  const dealing = (s.phase !== 'WAITING' && s.phase !== 'BETTING') || seedsFrozen(s);
   return dealing && !!s.hand?.players.some((p) => p.userId === userId);
 }
 
@@ -1303,7 +1346,7 @@ function requireDealer(s: RoomState, userId: string): void {
 
 function bettingPlayer(s: RoomState, userId: string, handNo: number): { seat: SeatState; hp: HandPlayer } {
   const seat = requireSeat(s, userId);
-  if (s.phase !== 'BETTING' || awaitingBeacon(s)) throw new RoomError('BAD_PHASE', 'ベット受付中ではありません');
+  if (s.phase !== 'BETTING' || seedsFrozen(s)) throw new RoomError('BAD_PHASE', 'ベットは締め切られました（全員の確定でシードを確定済み）');
   if (handNo !== s.handNo) throw new RoomError('STALE', '画面が古くなっています');
   const hp = s.hand!.players.find((p) => p.userId === userId);
   if (!hp) throw new RoomError('NOT_SEATED', 'このハンドには参加できません');

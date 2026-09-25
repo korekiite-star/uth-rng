@@ -12,11 +12,14 @@ import {
   DEFAULT_RULES,
   LEGAL_ACTIONS,
   TIMEOUT_ACTION,
-  combineClientSeeds,
+  type BeaconValue,
+  beaconTargetRound,
   commitOf,
   dealFromDeck,
   fairDeck,
+  isBeaconConsistent,
   isValidClientSeed,
+  mixInput,
   needsActionOn,
   newServerSeed,
   requiredBalance,
@@ -41,6 +44,7 @@ import type {
   SeatStatus,
   SessionSummary,
   ShowdownView,
+  VoidedHand,
 } from '@uth/protocol';
 
 export class RoomError extends Error {
@@ -60,7 +64,13 @@ export const DEFAULT_CONFIG: RoomConfig = {
   actionSeconds: 60,
   resultSeconds: 15,
   maxSeats: 7,
+  useBeacon: true,
 };
+
+/** ディールで公開乱数（drand）を待つ最長時間。過ぎたらハンドを無効にする（まだ誰にもカードは配られていない） */
+export const BEACON_TIMEOUT_MS = 20_000;
+/** 無効にしたハンドの記録を残す件数 */
+const VOIDED_LIMIT = 10;
 
 export const STARTING_BALANCE = 10_000;
 export const MAX_ADDON = 1_000_000;
@@ -116,7 +126,17 @@ export interface HandState {
    * プルーブリーフェア: serverSeed は精算まで秘密（コミットだけ公開）。
    * clientSeeds はベット確定した人のもの、order はディール時に確定する配る順
    */
-  fair?: { serverSeed: string; commit: string; clientSeeds: Record<string, string>; order?: string[] };
+  fair?: {
+    serverSeed: string;
+    commit: string;
+    clientSeeds: Record<string, string>;
+    order?: string[];
+    /**
+     * 公開乱数（drand）。ディールを押した瞬間にシードと order を確定し、round を決める（frozenAt）。
+     * value が届いたら山札を作って配る。届くまではベットの変更も着席も受け付けない
+     */
+    beacon?: { round: number; frozenAt: number; value?: BeaconValue };
+  };
 }
 
 export interface RoomState {
@@ -154,6 +174,8 @@ export interface RoomState {
   demo?: boolean;
   /** デモ卓を作った人（ディーラー ⇔ プレイヤーを切り替えられる。プレイヤーの間は Bot がディーラー） */
   demoOwner?: string;
+  /** 公開乱数を取得できずに無効にしたハンド（新しい順。サーバーシードも公開する） */
+  voided?: VoidedHand[];
   /** 途中で退席した人のこの卓での収支（ゲーム終了時の収支一覧に含める） */
   departed?: { userId: string; name: string; net: number; addon: number; balance: number }[];
   log: LogEntry[];
@@ -242,7 +264,9 @@ export type Command =
   | { t: 'JOIN'; name: string; balance?: number; account?: string; watch?: boolean }
   | { t: 'TIMEOUT' }
   /** サーバー内部: ディーラーの接続が全部切れた / 戻った */
-  | { t: 'DEALER_PRESENCE'; connected: boolean };
+  | { t: 'DEALER_PRESENCE'; connected: boolean }
+  /** サーバー内部: 待っていた公開乱数（drand）が届いた → 山札を作って配る */
+  | { t: 'BEACON'; handNo: number; value: BeaconValue };
 
 export interface Ctx {
   userId: string;
@@ -306,13 +330,20 @@ function handle(s: RoomState, ctx: Ctx, cmd: Command): void {
   s.config = { ...DEFAULT_CONFIG, ...s.config };
   if (s.closed) throw new RoomError('ROOM_CLOSED', 'この卓は解散しました');
   // 人の操作・接続だけを「活動」として数える（タイマーや接続切れは数えない）
-  if (cmd.t !== 'TIMEOUT' && cmd.t !== 'DEALER_PRESENCE' && cmd.t !== 'PING' && cmd.t !== 'RESYNC') s.lastActiveAt = now;
+  if (cmd.t !== 'TIMEOUT' && cmd.t !== 'DEALER_PRESENCE' && cmd.t !== 'BEACON' && cmd.t !== 'PING' && cmd.t !== 'RESYNC') s.lastActiveAt = now;
 
   switch (cmd.t) {
     case 'JOIN':
       return join(s, userId, cmd, now);
     case 'TIMEOUT':
       return timeout(s, now);
+    case 'BEACON': {
+      const b = s.hand?.fair?.beacon;
+      if (s.phase !== 'BETTING' || !b || b.value || cmd.handNo !== s.handNo) throw new RoomError('STALE', '公開乱数を待っていません');
+      if (cmd.value.round !== b.round || !isBeaconConsistent(cmd.value)) throw new RoomError('BAD_REQUEST', '公開乱数の値が正しくありません');
+      b.value = { network: 'quicknet', round: cmd.value.round, randomness: cmd.value.randomness, signature: cmd.value.signature };
+      return deal(s, now);
+    }
     case 'DEALER_PRESENCE':
       if (cmd.connected) s.dealerGoneAt = null;
       else if (s.phase !== 'WAITING' && !s.dealerGoneAt) {
@@ -431,7 +462,7 @@ function handle(s: RoomState, ctx: Ctx, cmd: Command): void {
       log(
         s,
         now,
-        `卓設定を変更: 席数 ${s.config.maxSeats} / アンティ ${s.config.minAnte}〜${s.config.maxAnte} / トリップス上限 ${s.config.maxTrips}`,
+        `卓設定を変更: 席数 ${s.config.maxSeats} / アンティ ${s.config.minAnte}〜${s.config.maxAnte} / トリップス上限 ${s.config.maxTrips} / 公開乱数 ${s.config.useBeacon ? 'ON' : 'OFF'}`,
       );
       return;
 
@@ -555,7 +586,7 @@ function join(s: RoomState, userId: string, cmd: Extract<Command, { t: 'JOIN' }>
     account: cmd.account,
   });
   s.seats.sort((a, b) => a.seat - b.seat);
-  if (s.phase === 'BETTING' && s.hand) s.hand.players.push(newHandPlayer(userId));
+  if (s.phase === 'BETTING' && s.hand && !awaitingBeacon(s)) s.hand.players.push(newHandPlayer(userId));
   log(s, now, `${clean} が着席しました`);
 }
 
@@ -596,21 +627,23 @@ function advance(s: RoomState, ctx: Ctx): void {
         log(s, now, `ハンド #${s.handNo} は参加者がいないため無効になりました`);
         return;
       }
-      // 山札はサーバーシード（コミット済み）と参加者のクライアントシードから決まる（検算方法は engine/fair.ts）
+      // 山札はサーバーシード（コミット済み）・参加者のクライアントシード・公開乱数から決まる（検算方法は engine/fair.ts）
+      // まず参加者とシードをここで確定する（以後は変えられない）
       const fair = (hand.fair ??= newFair(ctx));
       const order = confirmed.map((p) => p.userId);
       fair.clientSeeds = Object.fromEntries(Object.entries(fair.clientSeeds).filter(([id]) => order.includes(id)));
       fair.order = order;
-      const deck = fairDeck(fair.serverSeed, combineClientSeeds(fair.clientSeeds), hand.handNo);
-      const dealt = dealFromDeck(deck, order);
-      for (const p of confirmed) p.hole = dealt.holes[p.userId]!;
-      hand.dealerHole = dealt.dealer;
-      hand.community = dealt.community;
-      hand.deck = deck.slice(order.length * 2 + 7);
+      for (const p of hand.players) if (p.status === 'BETTING') p.status = 'SITTING_OUT';
       hand.players = confirmed;
-      s.phase = 'PREFLOP';
-      log(s, now, `ディール（${confirmed.length} 人参加）`);
-      enterStreet(s, 'PREFLOP', now);
+      if (!s.config.useBeacon) {
+        log(s, now, '⚠ 公開乱数なしでディール（卓の設定で OFF）');
+        return deal(s, now);
+      }
+      // 確定した時点ではまだ誰も知らない drand の未来のラウンドを待ってから配る（運営もシードを選び直せない）
+      const round = beaconTargetRound(now);
+      fair.beacon = { round, frozenAt: now };
+      hand.deadline = now + BEACON_TIMEOUT_MS;
+      log(s, now, `参加者のシードを確定（${confirmed.length} 人）。公開乱数 drand #${round} を待っています`);
       return;
     }
     case 'PREFLOP': {
@@ -652,6 +685,53 @@ function advance(s: RoomState, ctx: Ctx): void {
   }
 }
 
+/** 確定済みのシード（と公開乱数）から山札を作って配る */
+function deal(s: RoomState, now: number): void {
+  const hand = s.hand!;
+  const fair = hand.fair!;
+  const order = fair.order!;
+  const deck = fairDeck(fair.serverSeed, mixInput(fair.clientSeeds, fair.beacon?.value), hand.handNo);
+  const dealt = dealFromDeck(deck, order);
+  for (const p of hand.players) p.hole = dealt.holes[p.userId]!;
+  hand.dealerHole = dealt.dealer;
+  hand.community = dealt.community;
+  hand.deck = deck.slice(order.length * 2 + 7);
+  s.phase = 'PREFLOP';
+  log(s, now, `ディール（${order.length} 人参加${fair.beacon?.value ? `・公開乱数 drand #${fair.beacon.value.round}` : ''}）`);
+  enterStreet(s, 'PREFLOP', now);
+}
+
+/** 公開乱数を待っている（シード確定済み・まだ配っていない）か */
+export function awaitingBeacon(s: Pick<RoomState, 'phase' | 'hand'>): boolean {
+  const b = s.hand?.fair?.beacon;
+  return s.phase === 'BETTING' && !!b && !b.value;
+}
+
+/**
+ * 公開乱数が時間内に取れなかったハンドを無効にする（カードはまだ誰にも配っていない。ベットは精算まで残高から引いていないので全額返金）。
+ * 運営が「都合の悪い山札のときだけ取得失敗にする」ことを疑えるよう、サーバーシードを含めて記録を公開する
+ */
+function voidHandForBeacon(s: RoomState, now: number): void {
+  const hand = s.hand!;
+  const f = hand.fair!;
+  const round = f.beacon!.round;
+  const entry: VoidedHand = {
+    handNo: hand.handNo,
+    at: now,
+    reason: `公開乱数 drand #${round} を ${BEACON_TIMEOUT_MS / 1000} 秒以内に取得できませんでした`,
+    round,
+    commit: f.commit,
+    serverSeed: f.serverSeed,
+    clientSeeds: { ...f.clientSeeds },
+    order: [...(f.order ?? [])],
+  };
+  s.voided = [entry, ...(s.voided ?? [])].slice(0, VOIDED_LIMIT);
+  log(s, now, `⚠ ${entry.reason}。ハンド #${hand.handNo} を無効にしました（カードは配っていません・ベットは全額返金）`);
+  s.hand = null;
+  s.phase = 'WAITING';
+  for (const seat of s.seats.filter((x) => x.kicked || x.leaving)) removeSeat(s, seat.userId);
+}
+
 function newFair(ctx: Ctx): NonNullable<HandState['fair']> {
   const serverSeed = ctx.serverSeed?.() ?? newServerSeed();
   return { serverSeed, commit: commitOf(serverSeed), clientSeeds: {} };
@@ -661,7 +741,14 @@ function newFair(ctx: Ctx): NonNullable<HandState['fair']> {
 function fairRecord(hand: HandState): FairRecord | undefined {
   const f = hand.fair;
   if (!f?.order) return undefined;
-  return { handNo: hand.handNo, commit: f.commit, serverSeed: f.serverSeed, clientSeeds: { ...f.clientSeeds }, order: [...f.order] };
+  return {
+    handNo: hand.handNo,
+    commit: f.commit,
+    serverSeed: f.serverSeed,
+    clientSeeds: { ...f.clientSeeds },
+    order: [...f.order],
+    ...(f.beacon?.value ? { beacon: { ...f.beacon.value } } : {}),
+  };
 }
 
 function enterStreet(s: RoomState, street: Street, now: number): void {
@@ -717,6 +804,7 @@ function timeout(s: RoomState, now: number): void {
     return;
   }
   if (hand.deadline === null || now < hand.deadline) return;
+  if (awaitingBeacon(s)) return voidHandForBeacon(s, now);
   if (s.phase === 'BETTING') {
     for (const p of hand.players) {
       if (p.status !== 'BETTING') continue;
@@ -912,6 +1000,9 @@ export function lockState(s: RoomState, now: number): Omit<DealerControls, 'next
         : { canAdvance: false, lockReason: '着席しているプレイヤーがいません', waitingFor: [] };
     }
     case 'BETTING': {
+      if (awaitingBeacon(s)) {
+        return { canAdvance: false, lockReason: `公開乱数 drand #${s.hand!.fair!.beacon!.round} を待っています`, waitingFor: [] };
+      }
       const waiting = s.hand!.players.filter((p) => p.status === 'BETTING').map((p) => p.userId);
       return waiting.length
         ? { canAdvance: false, lockReason: `ベット待ち: ${names(waiting).join(', ')}`, waitingFor: waiting }
@@ -1016,7 +1107,17 @@ export function viewFor(s: RoomState, userId: string, now: number, connected: Re
     spectators: [...connected].filter((id) => id !== s.dealerId && !s.seats.some((x) => x.userId === id)).length,
     demoOwner: !!s.demo && userId === s.demoOwner,
     // サーバーシードは精算まで送らない（コミットだけ）
-    fair: hand?.fair ? { handNo: hand.handNo, commit: hand.fair.commit, myClientSeed: hand.fair.clientSeeds[userId] ?? null } : null,
+    // 確定したクライアントシードと公開乱数のラウンドは、配る前に全員に見せる（あとで選び直していないことの証拠）
+    fair: hand?.fair
+      ? {
+          handNo: hand.handNo,
+          commit: hand.fair.commit,
+          myClientSeed: hand.fair.clientSeeds[userId] ?? null,
+          beacon: hand.fair.beacon ? { round: hand.fair.beacon.round, waiting: !hand.fair.beacon.value } : null,
+          frozenSeeds: hand.fair.order ? { ...hand.fair.clientSeeds } : null,
+        }
+      : null,
+    voidedHands: s.voided ?? [],
     // 進行ログはディーラーだけ（プレイヤーは自分のハンド履歴を見る）
     log: isDealer ? s.log : [],
   };
@@ -1122,7 +1223,9 @@ function committed(hp: HandPlayer | undefined): number {
 }
 
 function inDealtHand(s: RoomState, userId: string): boolean {
-  return s.phase !== 'WAITING' && s.phase !== 'BETTING' && !!s.hand?.players.some((p) => p.userId === userId);
+  // 公開乱数を待っている間も、参加者は確定済み（配る順が決まっている）なので途中で抜けられない
+  const dealing = (s.phase !== 'WAITING' && s.phase !== 'BETTING') || awaitingBeacon(s);
+  return dealing && !!s.hand?.players.some((p) => p.userId === userId);
 }
 
 /** デモ卓で作った人がプレイヤーの間、ディーラーを務める Bot の ID */
@@ -1163,7 +1266,7 @@ function requireDealer(s: RoomState, userId: string): void {
 
 function bettingPlayer(s: RoomState, userId: string, handNo: number): { seat: SeatState; hp: HandPlayer } {
   const seat = requireSeat(s, userId);
-  if (s.phase !== 'BETTING') throw new RoomError('BAD_PHASE', 'ベット受付中ではありません');
+  if (s.phase !== 'BETTING' || awaitingBeacon(s)) throw new RoomError('BAD_PHASE', 'ベット受付中ではありません');
   if (handNo !== s.handNo) throw new RoomError('STALE', '画面が古くなっています');
   const hp = s.hand!.players.find((p) => p.userId === userId);
   if (!hp) throw new RoomError('NOT_SEATED', 'このハンドには参加できません');
@@ -1198,6 +1301,7 @@ function validateConfig(c: RoomConfig): RoomConfig {
   intIn(c.actionSeconds, 5, 300, 'アクション制限時間');
   intIn(c.resultSeconds, 0, 60, '結果表示時間');
   intIn(c.maxSeats, 1, 7, '最大席数');
+  if (typeof c.useBeacon !== 'boolean') throw new RoomError('BAD_REQUEST', '公開乱数の設定が正しくありません');
   return { ...c };
 }
 

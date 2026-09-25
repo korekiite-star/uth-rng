@@ -7,7 +7,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { commitOf, verifyFair } from '../src/index.js';
+import { commitOf, sha256, toHex, verifyFair } from '../src/index.js';
 
 const script = join(__dirname, '../../../apps/web/public/verify_hand.py');
 const hasPython = (() => {
@@ -24,12 +24,21 @@ describe.skipIf(!hasPython)('Python の独立実装と一致', () => {
     const dir = mkdtempSync(join(tmpdir(), 'uth-fair-'));
     for (let n = 0; n < 5; n++) {
       const serverSeed = `server-${n}-` + 'ab'.repeat(20);
+      // 半分は公開乱数（drand）入りのハンド。randomness = SHA-256(signature) の形にする
+      const signature = toHex(sha256(new TextEncoder().encode(`sig${n}`))).repeat(3);
+      const beacon = {
+        network: 'quicknet' as const,
+        round: 32_500_000 + n,
+        signature,
+        randomness: toHex(sha256(Uint8Array.from(signature.match(/../g)!.map((h) => parseInt(h, 16))))),
+      };
       const rec = {
         handNo: 100 + n,
         commit: commitOf(serverSeed),
         serverSeed,
         clientSeeds: { 'g:222': `seed${n}b`, 'g:111': `seed${n}a`, 'bot-x': 'zz' },
         order: ['g:222', 'bot-x', 'g:111'],
+        ...(n % 2 ? { beacon } : {}),
       };
       const file = join(dir, `h${n}.json`);
       writeFileSync(file, JSON.stringify(rec));
@@ -37,6 +46,7 @@ describe.skipIf(!hasPython)('Python の独立実装と一致', () => {
       const deckLine = out.split(/\r?\n/).find((l) => l.startsWith('山札:'))!;
       expect(deckLine.replace('山札:', '').trim().split(' ')).toEqual(verifyFair(rec).deck);
       expect(out).toContain('コミット一致: OK');
+      if (n % 2) expect(out).toContain(`drand #${beacon.round}  randomness = SHA-256(signature): OK`);
     }
   });
 });

@@ -13,12 +13,15 @@
  * 山札の計算手順（他の言語でも同じ結果になるよう、単純な標準部品だけで組む）:
  *   commit      = hex(SHA-256(utf8(serverSeed)))
  *   clientSeeds = 参加者を userId の昇順に並べ、"userId:seed" を "|" でつないだ文字列（参加者が送らなければ空）
- *   乱数列      = HMAC-SHA256(key = utf8(serverSeed), msg = utf8(`${clientSeeds}:${handNo}:${counter}`))
+ *   mix         = 公開乱数ビーコン（drand）を使ったハンドは `${clientSeeds}#drand:${round}:${randomness}`、使わなかったハンドは clientSeeds
+ *                 （ビーコンはディールの瞬間にシードを確定・公開した後に公開されるラウンド。beacon.ts 参照）
+ *   乱数列      = HMAC-SHA256(key = utf8(serverSeed), msg = utf8(`${mix}:${handNo}:${counter}`))
  *                 を counter = 0, 1, 2, … と連結し、4 バイトずつビッグエンディアンの uint32 として読む
  *   randomInt(n)= 次の uint32 v が floor(2^32 / n) * n 未満なら v % n、そうでなければ次の v で引き直す
  *   山札        = 初期順 2s 3s … As 2h … Ah 2d … Ad 2c … Ac を Fisher–Yates（i = 51 → 1、j = randomInt(i+1) と交換）
  *   配札        = 山札の先頭から、参加者（着席順）に 2 枚ずつ → ディーラー 2 枚 → ボード 5 枚
  */
+import type { BeaconValue } from './beacon.js';
 import { type Card, type RandomInt, createDeck, shuffle } from './cards.js';
 
 // ------------------------------------------------------------------ SHA-256 / HMAC（同期版。Workers・ブラウザ・Node で同じコード）
@@ -133,6 +136,12 @@ export function combineClientSeeds(seeds: Readonly<Record<string, string>>): str
     .join('|');
 }
 
+/** 山札の乱数に混ぜる文字列（クライアントシード + 公開乱数ビーコン） */
+export function mixInput(seeds: Readonly<Record<string, string>>, beacon?: Pick<BeaconValue, 'round' | 'randomness'> | null): string {
+  const c = combineClientSeeds(seeds);
+  return beacon ? `${c}#drand:${beacon.round}:${beacon.randomness}` : c;
+}
+
 // ------------------------------------------------------------------ 山札
 
 /** シードから決まる一様乱数（HMAC-SHA256 の出力を 4 バイトずつ使い、剰余バイアスは棄却サンプリングで除く） */
@@ -186,9 +195,11 @@ export interface FairRecord {
   clientSeeds: Record<string, string>;
   /** 配った順（着席順）の userId */
   order: string[];
+  /** 混ぜた公開乱数（drand）。無ければビーコンなしのハンド（導入前・ディーラーが OFF にした卓） */
+  beacon?: BeaconValue;
 }
 
 export function verifyFair(r: FairRecord): { commitOk: boolean; deal: FairDeal; deck: Card[] } {
-  const deck = fairDeck(r.serverSeed, combineClientSeeds(r.clientSeeds), r.handNo);
+  const deck = fairDeck(r.serverSeed, mixInput(r.clientSeeds, r.beacon), r.handNo);
   return { commitOk: commitOf(r.serverSeed) === r.commit, deal: dealFromDeck(deck, r.order), deck };
 }

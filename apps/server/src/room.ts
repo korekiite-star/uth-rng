@@ -45,6 +45,7 @@ import type {
   SessionSummary,
   ShowdownView,
   VoidedHand,
+  WinLossRecord,
 } from '@uth/protocol';
 
 export class RoomError extends Error {
@@ -94,6 +95,8 @@ export interface SeatState {
   account?: string;
   /** この卓で参加したハンドの記録（古い順、最大 HISTORY_LIMIT 件） */
   hands?: MyHandEntry[];
+  /** この卓での勝敗（ハンド履歴は直近だけなので別に数える） */
+  record?: WinLossRecord;
   /** デモ卓の Bot（卓の中で自動で動く） */
   bot?: boolean;
 }
@@ -156,6 +159,8 @@ export interface RoomState {
   /** セッション開始時の JP プール（ディーラー収支に JP を含める集計の基準） */
   poolAtStart?: number;
   dealerSessionNet: number;
+  /** ディーラーのこの卓での勝敗（ハンドごとの収支の符号で数える） */
+  dealerRecord?: WinLossRecord;
   handsPlayed: number;
   hand: HandState | null;
   lastResult: ShowdownView | null;
@@ -501,6 +506,22 @@ function handle(s: RoomState, ctx: Ctx, cmd: Command): void {
       log(s, now, '卓が解散されました');
       return;
 
+    case 'DEMO_REMOVE_BOT': {
+      if (!s.demo) throw new RoomError('BAD_REQUEST', 'Bot はデモ卓にしかいません');
+      if (userId !== s.demoOwner) requireDealer(s, userId);
+      const seat = s.seats.find((x) => x.userId === cmd.userId && x.bot);
+      if (!seat) throw new RoomError('BAD_REQUEST', 'その Bot は座っていません');
+      if (inDealtHand(s, seat.userId)) {
+        // 配られた手札は最後まで Bot が打ってから退席する
+        seat.leaving = true;
+        log(s, now, `${seat.name} はこのハンド終了後に退席します`);
+      } else {
+        removeSeat(s, seat.userId);
+        log(s, now, `${seat.name} を外しました`);
+      }
+      return;
+    }
+
     case 'DEMO_SWITCH_ROLE': {
       if (!s.demo || userId !== s.demoOwner) throw new RoomError('BAD_REQUEST', '切り替えはデモ卓を作った人だけができます');
       if (s.phase !== 'WAITING' && s.phase !== 'BETTING') throw new RoomError('BAD_PHASE', 'ハンドの合間かベット受付中に切り替えてください');
@@ -839,6 +860,14 @@ function showdown(s: RoomState, now: number): void {
   s.dealerSessionNet += result.dealer.net;
   s.jackpotPool = result.jackpot.poolAfter;
   s.handsPlayed++;
+  // ディーラーの勝敗: そのハンドの収支（JP 込み = −Σプレイヤー収支）がプラスなら勝ち
+  {
+    const dealerHandNet = -result.players.reduce((sum, r) => sum + r.net, 0);
+    const rec = (s.dealerRecord ??= { win: 0, lose: 0, tie: 0, fold: 0 });
+    if (dealerHandNet > 0) rec.win++;
+    else if (dealerHandNet < 0) rec.lose++;
+    else rec.tie++;
+  }
   s.history = [
     ...(s.history ?? []),
     {
@@ -910,6 +939,12 @@ function showdown(s: RoomState, now: number): void {
     const hp = hand.players.find((x) => x.userId === p.userId)!;
     if (!seat) continue;
     const d = resolveDecision(hp.actions);
+    // 勝敗（ディーラーとの本戦の結果で数える。フォールドは別に数える）
+    const rec = (seat.record ??= { win: 0, lose: 0, tie: 0, fold: 0 });
+    if (p.outcome === 'WIN') rec.win++;
+    else if (p.outcome === 'LOSE') rec.lose++;
+    else if (p.outcome === 'TIE') rec.tie++;
+    else rec.fold++;
     seat.hands = [
       ...(seat.hands ?? []),
       {
@@ -1106,6 +1141,8 @@ export function viewFor(s: RoomState, userId: string, now: number, connected: Re
     sessionPlayers: isDealer ? sessionPlayers(s).map(({ userId, name, net }) => ({ userId, name, net })) : null,
     spectators: [...connected].filter((id) => id !== s.dealerId && !s.seats.some((x) => x.userId === id)).length,
     demoOwner: !!s.demo && userId === s.demoOwner,
+    // この卓での勝敗（本人の分だけ。ディーラーはディーラーの分）
+    myRecord: isDealer ? (s.dealerRecord ?? null) : (mySeat?.record ?? null),
     // サーバーシードは精算まで送らない（コミットだけ）
     // 確定したクライアントシードと公開乱数のラウンドは、配る前に全員に見せる（あとで選び直していないことの証拠）
     fair: hand?.fair

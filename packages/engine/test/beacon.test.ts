@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DRAND, beaconRoundTime, beaconTargetRound, beaconUrl, isBeaconConsistent } from '../src/index.js';
+import { BEACON_MARGIN_MS, DRAND, beaconRoundTime, beaconTargetRound, beaconUrl, isBeaconConsistent } from '../src/index.js';
 
 /** drand quicknet の本物の値（https://api.drand.sh/<chain>/public/32511553 で誰でも確認できる） */
 const REAL = {
@@ -15,15 +15,15 @@ describe('公開乱数ビーコン（drand quicknet）', () => {
     expect(isBeaconConsistent({ ...REAL, signature: REAL.signature.slice(0, -1) })).toBe(false);
   });
 
-  it('ラウンドの公開時刻と、確定時刻から選ぶラウンド（公開が 1 秒以上あと = まだ誰も知らない）', () => {
+  it('ラウンドの公開時刻と、確定時刻から選ぶラウンド（公開が余裕の分以上あと = まだ誰も知らない）', () => {
     expect(beaconRoundTime(1)).toBe(DRAND.genesis * 1000);
     expect(beaconRoundTime(2) - beaconRoundTime(1)).toBe(DRAND.period * 1000);
     for (const offset of [0, 1, 999, 1000, 1001, 2999, 3000, 12345]) {
       const now = beaconRoundTime(REAL.round) + offset;
       const r = beaconTargetRound(now);
-      expect(beaconRoundTime(r)).toBeGreaterThanOrEqual(now + 1000);
-      expect(beaconRoundTime(r - 1)).toBeLessThan(now + 1000);
-      expect(beaconRoundTime(r) - now).toBeLessThanOrEqual(1000 + DRAND.period * 1000);
+      expect(beaconRoundTime(r)).toBeGreaterThanOrEqual(now + BEACON_MARGIN_MS);
+      expect(beaconRoundTime(r - 1)).toBeLessThan(now + BEACON_MARGIN_MS);
+      expect(beaconRoundTime(r) - now).toBeLessThanOrEqual(BEACON_MARGIN_MS + DRAND.period * 1000);
     }
   });
 

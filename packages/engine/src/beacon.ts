@@ -36,10 +36,16 @@ export function beaconRoundTime(round: number): number {
 }
 
 /**
+ * 確定時刻と、使うラウンドの公開時刻の間に最低限あける余裕（ms）。
+ * サーバーの時計のずれを見込んでも「確定の時点ではまだ公開されていない」と言える幅。短いほど早く配れる
+ */
+export const BEACON_MARGIN_MS = 400;
+
+/**
  * シードを確定した時刻 now（ms）に対して使うラウンド。
  * 公開が now + marginMs 以降になる最初のラウンド（= 確定の時点ではまだ誰も値を知らない）
  */
-export function beaconTargetRound(now: number, marginMs = 1000): number {
+export function beaconTargetRound(now: number, marginMs = BEACON_MARGIN_MS): number {
   const t = (now + marginMs) / 1000;
   return Math.max(1, Math.ceil((t - DRAND.genesis) / DRAND.period) + 1);
 }

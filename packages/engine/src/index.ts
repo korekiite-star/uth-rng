@@ -6,3 +6,4 @@ export * from './jackpot.js';
 export * from './settlement.js';
 export * from './fair.js';
 export * from './beacon.js';
+export * as PaiGow from './paigow/cards.js';

@@ -50,12 +50,24 @@ UTH の山札がどう作られるかの全体と、見るべきファイルの�
 | `packages/engine/src/fair.ts` | SHA-256 / HMAC-SHA256（外部ライブラリなしの実装）、シード生成、乱数列、山札の作成、配札、検算 |
 | `packages/engine/src/beacon.ts` | 公開乱数 drand quicknet（ラウンドの選び方、公開時刻、randomness = SHA-256(signature) の確認） |
 | `packages/engine/src/cards.ts` | 52 枚の初期順、`shuffle`（Fisher–Yates）、`cryptoRandomInt`（棄却サンプリング） |
+| `packages/engine/src/paigow/cards.ts` | パイガオの 53 枚（52 枚 + ジョーカー）の山札 `fairDeck53`（下の「パイガオの山札」） |
+| `packages/engine/test/paigow-deck.test.ts` | 53 枚の山札が並び替えになっているか、公開手順の別実装と一致するか、ジョーカーの位置の一様性 |
 | `apps/server/src/room.ts` | 実際にハンドで使っている箇所（`newFair` / ディールでのシード確定と drand 待ち / `deal` / 取得失敗時の無効化 `voidHandForBeacon` / 精算後の公開 `fairRecord`） |
 | `apps/web/src/lib/fairSeeds.ts` | ブラウザ側のクライアントシード |
 | `apps/web/public/verify_hand.py` | 同じ計算を Python の標準ライブラリだけで書いた独立実装（1 ハンドの検算） |
 | `packages/engine/test/fair.test.ts` | SHA-256 / HMAC が Node の crypto と一致するか、各位置のカードの一様性（カイ二乗） |
 | `packages/engine/test/fair-python.test.ts` | TypeScript 版と Python 版が同じ山札を出すか |
 | `scripts/fairness/report.ts` `render.ts` | 10 万ハンドの統計レポート（52 枚 × 配る位置の一様性、役の出現率、勝敗の対称性、連続ハンドの独立性） |
+
+## パイガオの山札（53 枚）
+
+パイガオポーカーは 52 枚にジョーカー 1 枚を足した 53 枚で遊びます。乱数の作り方は 52 枚とまったく同じです（同じ HMAC-SHA256 の乱数列・同じ棄却サンプリング）。違うのは山札の初期順と混ぜる回数だけです。
+
+- 初期順: 52 枚の初期順（2s 3s … As 2h … Ac）の **最後にジョーカー（`Jk`）**
+- 混ぜ方: Fisher–Yates を i = 52 → 1 で（j = randomInt(i+1) と交換）
+- 配札: 山札の先頭から、着席順に 7 枚ずつ（ディーラーを含む）
+
+`fairDeck53(serverSeed, mix, handNo)` の `mix` は 52 枚と同じく、公開乱数（drand）を使ったハンドなら `#drand:<round>:<randomness>` が入ります。
 
 ## 自分で確かめる方法
 
@@ -65,7 +77,7 @@ UTH の山札がどう作られるかの全体と、見るべきファイルの�
 # Node.js 22 以上
 cd packages/engine
 npm install
-npx vitest run          # SHA-256 / HMAC の一致、一様性、Python 版との一致、公開乱数の確認、役判定の全数検査など 25 件
+npx vitest run          # SHA-256 / HMAC の一致、一様性、Python 版との一致、公開乱数の確認、パイガオの 53 枚の山札、役判定の全数検査など 29 件
 
 python ../../apps/web/public/verify_hand.py hand.json --online   # 1 ハンドの検算（Python 3、標準ライブラリだけ。--online で drand の公式値とも照合）
 ```
